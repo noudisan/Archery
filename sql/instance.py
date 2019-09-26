@@ -14,7 +14,7 @@ from sql.plugins.schemasync import SchemaSync
 from .models import Instance, ParamTemplate, ParamHistory
 
 
-@permission_required('sql.menu_instance', raise_exception=True)
+@permission_required('sql.menu_instance_list', raise_exception=True)
 def lists(request):
     """获取实例列表"""
     limit = int(request.POST.get('limit'))
@@ -51,34 +51,6 @@ def lists(request):
     rows = [row for row in instances]
 
     result = {"total": count, "rows": rows}
-    return HttpResponse(json.dumps(result, cls=ExtendJSONEncoder, bigint_as_string=True),
-                        content_type='application/json')
-
-
-@permission_required('sql.menu_instance', raise_exception=True)
-def users(request):
-    """获取实例用户列表"""
-    instance_id = request.POST.get('instance_id')
-    try:
-        instance = Instance.objects.get(id=instance_id)
-    except Instance.DoesNotExist:
-        result = {'status': 1, 'msg': '实例不存在', 'data': []}
-        return HttpResponse(json.dumps(result), content_type='application/json')
-
-    sql_get_user = '''select concat("\'", user, "\'", '@', "\'", host,"\'") as query from mysql.user;'''
-    query_engine = get_engine(instance=instance)
-    db_users = query_engine.query('mysql', sql_get_user).rows
-    # 获取用户权限信息
-    data = []
-    for db_user in db_users:
-        user_info = {}
-        user_priv = query_engine.query('mysql', 'show grants for {};'.format(db_user[0]), close_conn=False).rows
-        user_info['user'] = db_user[0]
-        user_info['privileges'] = user_priv
-        data.append(user_info)
-    # 关闭连接
-    query_engine.close()
-    result = {'status': 0, 'msg': 'ok', 'rows': data}
     return HttpResponse(json.dumps(result, cls=ExtendJSONEncoder, bigint_as_string=True),
                         content_type='application/json')
 
@@ -283,17 +255,21 @@ def instance_resource(request):
     :param request:
     :return:
     """
+    instance_id = request.POST.get('instance_id')
     instance_name = request.POST.get('instance_name')
     db_name = request.POST.get('db_name')
     schema_name = request.POST.get('schema_name')
     tb_name = request.POST.get('tb_name')
 
     resource_type = request.POST.get('resource_type')
-    try:
-        instance = Instance.objects.get(instance_name=instance_name)
-    except Instance.DoesNotExist:
-        result = {'status': 1, 'msg': '实例不存在', 'data': []}
-        return HttpResponse(json.dumps(result), content_type='application/json')
+    if instance_id:
+        instance = Instance.objects.get(id=instance_id)
+    else:
+        try:
+            instance = Instance.objects.get(instance_name=instance_name)
+        except Instance.DoesNotExist:
+            result = {'status': 1, 'msg': '实例不存在', 'data': []}
+            return HttpResponse(json.dumps(result), content_type='application/json')
     result = {'status': 0, 'msg': 'ok', 'data': []}
 
     try:
@@ -349,4 +325,7 @@ def describe(request):
     except Exception as msg:
         result['status'] = 1
         result['msg'] = str(msg)
+    if result['data']['error']:
+        result['status'] = 1
+        result['msg'] = result['data']['error']
     return HttpResponse(json.dumps(result), content_type='application/json')

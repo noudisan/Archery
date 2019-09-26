@@ -24,10 +24,12 @@ class MysqlEngine(EngineBase):
             return self.conn
         if db_name:
             self.conn = MySQLdb.connect(host=self.host, port=self.port, user=self.user, passwd=self.password,
-                                        db=db_name, charset=self.instance.charset or 'utf8mb4')
+                                        db=db_name, charset=self.instance.charset or 'utf8mb4',
+                                        connect_timeout=10)
         else:
             self.conn = MySQLdb.connect(host=self.host, port=self.port, user=self.user, passwd=self.password,
-                                        charset=self.instance.charset or 'utf8mb4')
+                                        charset=self.instance.charset or 'utf8mb4',
+                                        connect_timeout=10)
         self.thread_id = self.conn.thread_id()
         return self.conn
 
@@ -40,8 +42,13 @@ class MysqlEngine(EngineBase):
         return 'MySQL engine'
 
     @property
+    def auto_backup(self):
+        """是否支持备份"""
+        return True
+
+    @property
     def seconds_behind_master(self):
-        slave_status = self.query(sql='show slave status')
+        slave_status = self.query(sql='show slave status', close_conn=False)
         return slave_status.rows[0][32] if slave_status.rows else None
 
     @property
@@ -72,13 +79,6 @@ class MysqlEngine(EngineBase):
 
     def get_all_columns_by_tb(self, db_name, tb_name):
         """获取所有字段, 返回一个ResultSet"""
-        result = self.describe_table(db_name, tb_name)
-        column_list = [row[0] for row in result.rows]
-        result.rows = column_list
-        return result
-
-    def describe_table(self, db_name, tb_name):
-        """return ResultSet 类似查询"""
         sql = f"""SELECT 
             COLUMN_NAME,
             COLUMN_TYPE,
@@ -93,7 +93,15 @@ class MysqlEngine(EngineBase):
             TABLE_SCHEMA = '{db_name}'
                 AND TABLE_NAME = '{tb_name}'
         ORDER BY ORDINAL_POSITION;"""
-        result = self.query(sql=sql)
+        result = self.query(db_name=db_name, sql=sql)
+        column_list = [row[0] for row in result.rows]
+        result.rows = column_list
+        return result
+
+    def describe_table(self, db_name, tb_name):
+        """return ResultSet 类似查询"""
+        sql = f"show create table {tb_name};"
+        result = self.query(db_name=db_name, sql=sql)
         return result
 
     def query(self, db_name=None, sql='', limit_num=0, close_conn=True):
@@ -113,7 +121,7 @@ class MysqlEngine(EngineBase):
             result_set.rows = rows
             result_set.affected_rows = effect_row
         except Exception as e:
-            logger.error(f"MySQL语句执行报错，语句：{sql}，错误信息{traceback.format_exc()}")
+            logger.warning(f"MySQL语句执行报错，语句：{sql}，错误信息{traceback.format_exc()}")
             result_set.error = str(e)
         finally:
             if close_conn:
@@ -140,13 +148,26 @@ class MysqlEngine(EngineBase):
         return result
 
     def filter_sql(self, sql='', limit_num=0):
-        # 对查询sql增加limit限制，# TODO limit改写待优化
-        sql_lower = sql.lower().rstrip(';').strip()
-        if re.match(r"^select", sql_lower):
-            if re.search(r"limit\s+(\d+)$", sql_lower) is None:
-                if re.search(r"limit\s+\d+\s*,\s*(\d+)$", sql_lower) is None:
-                    return f"{sql.rstrip(';')} limit {limit_num};"
-        return f"{sql.rstrip(';')};"
+        # 对查询sql增加limit限制,limit n 或 limit n,n 或 limit n offset n统一改写成limit n
+        sql = sql.rstrip(';').strip()
+        if re.match(r"^select", sql, re.I):
+            # LIMIT N
+            limit_n = re.compile(r'limit([\s]*\d+[\s]*)$', re.I)
+            # LIMIT N, N 或LIMIT N OFFSET N
+            limit_offset = re.compile(r'limit([\s]*\d+[\s]*)(,|offset)([\s]*\d+[\s]*)$', re.I)
+            if limit_n.search(sql):
+                sql_limit = limit_n.search(sql).group(1)
+                limit_num = min(int(limit_num), int(sql_limit))
+                sql = limit_n.sub(f'limit {limit_num};', sql)
+            elif limit_offset.search(sql):
+                sql_limit = limit_offset.search(sql).group(3)
+                limit_num = min(int(limit_num), int(sql_limit))
+                sql = limit_offset.sub(f'limit {limit_num};', sql)
+            else:
+                sql = f'{sql} limit {limit_num};'
+        else:
+            sql = f'{sql};'
+        return sql
 
     def query_masking(self, db_name=None, sql='', resultset=None):
         """传入 sql语句, db名, 结果集,
@@ -162,13 +183,13 @@ class MysqlEngine(EngineBase):
         """上线单执行前的检查, 返回Review set"""
         config = SysConfig()
         # 进行Inception检查，获取检测结果
-        if config.get('go_inception'):
+        if not config.get('inception'):
             try:
                 inception_engine = GoInceptionEngine()
                 inc_check_result = inception_engine.execute_check(instance=self.instance, db_name=db_name, sql=sql)
             except Exception as e:
-                logger.debug(f"Inception检测语句报错：错误信息{traceback.format_exc()}")
-                raise RuntimeError(f"Inception检测语句报错，请注意检查系统配置中Inception配置，错误信息：\n{e}")
+                logger.debug(f"goInception检测语句报错：错误信息{traceback.format_exc()}")
+                raise RuntimeError(f"goInception检测语句报错，请注意检查系统配置中goInception配置，错误信息：\n{e}")
         else:
             try:
                 inception_engine = InceptionEngine()
@@ -234,7 +255,7 @@ class MysqlEngine(EngineBase):
         if workflow.is_manual == 1:
             return self.execute(db_name=workflow.db_name, sql=workflow.sqlworkflowcontent.sql_content)
         # inception执行
-        elif SysConfig().get('go_inception'):
+        elif not SysConfig().get('inception'):
             inception_engine = GoInceptionEngine()
             return inception_engine.execute(workflow)
         else:
@@ -252,7 +273,7 @@ class MysqlEngine(EngineBase):
             conn.commit()
             cursor.close()
         except Exception as e:
-            logger.error(f"MySQL语句执行报错，语句：{sql}，错误信息{traceback.format_exc()}")
+            logger.warning(f"MySQL语句执行报错，语句：{sql}，错误信息{traceback.format_exc()}")
             result.error = str(e)
         if close_conn:
             self.close()
@@ -282,7 +303,7 @@ class MysqlEngine(EngineBase):
         """控制osc执行，获取进度、终止、暂停、恢复等
             get、kill、pause、resume
         """
-        if SysConfig().get('go_inception'):
+        if not SysConfig().get('inception'):
             go_inception_engine = GoInceptionEngine()
             return go_inception_engine.osc_control(**kwargs)
         else:
